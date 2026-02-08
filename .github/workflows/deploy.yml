@@ -1,0 +1,91 @@
+# ============================================================================
+# CI/CD - Inference API
+# ============================================================================
+#
+# Flujo:
+#   1. Push a main → build imagen Docker con tag sha-xxxxxxx
+#   2. Push al Artifact Registry
+#   3. Deploy al cluster GKE actualizando el tag de la imagen
+#
+# ============================================================================
+
+name: Deploy Inference API
+
+on:
+  push:
+    branches:
+      - main      # → deploy a dev
+      - release    # → deploy a production
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_NAME: "inference-api"
+  WORKLOAD_IDENTITY_PROVIDER: "projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider"
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'dev' || 'production' }}
+
+    steps:
+      # ================================================================
+      # Setup
+      # ================================================================
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.SERVICE_ACCOUNT }}
+
+      # Genera el tag corto del commit (sha-abc1234)
+      - name: Set image tag
+        run: echo "IMAGE_TAG=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
+
+      # ================================================================
+      # Build & Push
+      # ================================================================
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            -t ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker push ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      # ================================================================
+      # Deploy to GKE
+      # ================================================================
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GCP_ZONE }}
+
+      - name: Update image tag in manifest
+        run: |
+          sed -i "s|image: .*inference-api:.*|image: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" k8s/deployment.yaml
+
+      - name: Deploy to GKE
+        run: kubectl apply -f k8s/deployment.yaml
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/inference-api -n ${{ vars.K8S_NAMESPACE }} --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          echo "Deployed image: ${{ vars.ARTIFACT_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          kubectl get pods -n ${{ vars.K8S_NAMESPACE }} -l app=inference-api
