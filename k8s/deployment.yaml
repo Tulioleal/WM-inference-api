@@ -1,0 +1,102 @@
+# ============================================================================
+# Inference API - Kubernetes Manifest
+# ============================================================================
+# Este manifest pertenece al repo WM-inference-api.
+# Solo contiene recursos propios de la aplicación.
+#
+# Recursos que vienen de WM-infra:
+#   - Namespace: waste-detection
+#   - ConfigMap: infra-config (buckets de GCS)
+#   - Secret: db-credentials (URL de la base de datos)
+#   - ServiceAccount: waste-detection-app-sa (Workload Identity)
+# ============================================================================
+
+---
+# ConfigMap con valores de la aplicación
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: waste-detection
+data:
+  MODEL_VERSION: "latest"
+  LOG_LEVEL: "INFO"
+  CONFIDENCE_THRESHOLD: "0.5"
+  IOU_THRESHOLD: "0.45"
+  MAX_IMAGE_SIZE_MB: "10"
+  MAX_BATCH_SIZE: "32"
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-api
+  namespace: waste-detection
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-api
+  template:
+    metadata:
+      labels:
+        app: inference-api
+    spec:
+      serviceAccountName: waste-detection-app-sa
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: inference
+          effect: NoSchedule
+      containers:
+        - name: inference-api
+          image: us-central1-docker.pkg.dev/waste-detection-001/waste-detection-dev/inference-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: infra-config      # Buckets GCS (viene de Tofu)
+            - configMapRef:
+                name: app-config        # Config de la app (viene de este repo)
+            - secretRef:
+                name: db-credentials    # URL de la DB (viene de Tofu)
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-api-service
+  namespace: waste-detection
+spec:
+  type: LoadBalancer
+  selector:
+    app: inference-api
+  ports:
+    - port: 8000
+      targetPort: 8000
