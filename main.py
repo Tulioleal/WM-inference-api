@@ -44,7 +44,7 @@ storage_manager: Optional[StorageManager] = None
 
 
 # ============================================================================
-# Schemas Pydantic
+# Schemas Pydantic 
 # ============================================================================
 
 class Detection(BaseModel):
