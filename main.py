@@ -22,8 +22,8 @@ import numpy as np
 from PIL import Image
 import io
 
-from model_manager import ModelManager
-from database import DatabaseManager, InferenceRecord, ModelMetadata
+from model_manager import ModelManager, WASTE_CLASSES
+from database import DatabaseManager, InferenceRecord, ModelMetadata, VerificationStatus
 from storage import StorageManager
 from config import Settings
 
@@ -107,6 +107,30 @@ class MetricsResponse(BaseModel):
     requests_last_hour: int
     model_version: str
     uptime_seconds: float
+
+
+# --- Schemas de Verificación ---
+
+class VerificationUpdate(BaseModel):
+    """Request para actualizar verificación"""
+    status: str = Field(
+        ..., 
+        description="Estado: verified, corrected, needs_review, discarded"
+    )
+    verified_detections: Optional[List[Detection]] = Field(
+        None,
+        description="Detecciones corregidas (requerido si status='corrected')"
+    )
+    verified_by: str = Field(
+        default="anonymous",
+        description="Identificador del revisor"
+    )
+
+
+class UserFeedback(BaseModel):
+    """Feedback del usuario sobre una inferencia"""
+    is_correct: bool = Field(..., description="¿La inferencia es correcta?")
+    user_id: str = Field(default="anonymous", description="ID del usuario")
 
 
 # ============================================================================
@@ -196,153 +220,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/debug/storage-init", tags=["Debug"])
-async def debug_storage_init():
-    from config import Settings
-    s = Settings()
-    try:
-        from storage import StorageManager
-        sm = StorageManager(
-            models_bucket=s.gcs_models_bucket,
-            images_bucket=s.gcs_images_bucket
-        )
-        return {"success": True, "models_bucket": sm.models_bucket_name}
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {str(e)}"}
-
-@app.get("/debug/storage", tags=["Debug"])
-async def debug_storage():
-    results = {}
-    
-    results["storage_manager_exists"] = storage_manager is not None
-    
-    if storage_manager:
-        results["bucket_name"] = storage_manager.models_bucket_name
-        try:
-            from google.cloud import storage as gcs
-            client = gcs.Client()
-            bucket = client.bucket(storage_manager.models_bucket_name)
-            exists = bucket.exists()
-            results["bucket_exists"] = exists
-        except Exception as e:
-            results["error"] = f"{type(e).__name__}: {str(e)}"
-    
-    return results
-
-@app.get("/debug/network", tags=["Debug"])
-async def debug_network():
-    import socket
-    results = {}
-    
-    # ¿Puede conectar al DNS de Kubernetes?
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3)
-        s.connect(("10.2.0.10", 53))
-        s.close()
-        results["kube_dns_tcp"] = "reachable"
-    except Exception as e:
-        results["kube_dns_tcp"] = str(e)
-    
-    # ¿Qué tiene /etc/resolv.conf?
-    try:
-        with open("/etc/resolv.conf") as f:
-            results["resolv_conf"] = f.read()
-    except Exception as e:
-        results["resolv_conf_error"] = str(e)
-    
-    # ¿Puede alcanzar storage.googleapis.com por IP?
-    try:
-        import urllib.request
-        req = urllib.request.Request("https://142.250.80.128", headers={"Host": "storage.googleapis.com"})
-        resp = urllib.request.urlopen(req, timeout=3)
-        results["storage_api"] = "reachable"
-    except Exception as e:
-        results["storage_api_error"] = str(e)
-    
-    return results
-
-@app.get("/debug/dns", tags=["Debug"])
-async def debug_dns():
-    import socket
-    results = {}
-    
-    # ¿Resuelve DNS en general?
-    try:
-        results["google_dns"] = socket.getaddrinfo("google.com", 443)[0][4][0]
-    except Exception as e:
-        results["google_dns_error"] = str(e)
-    
-    # ¿Resuelve el metadata server?
-    try:
-        results["metadata_dns"] = socket.getaddrinfo("metadata.google.internal", 80)[0][4][0]
-    except Exception as e:
-        results["metadata_dns_error"] = str(e)
-    
-    # ¿Resuelve por IP directa?
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/email",
-            headers={"Metadata-Flavor": "Google"}
-        )
-        resp = urllib.request.urlopen(req, timeout=3)
-        results["metadata_by_ip"] = resp.read().decode()
-    except Exception as e:
-        results["metadata_by_ip_error"] = str(e)
-    
-    return results
-
-@app.get("/debug/workload-identity", tags=["Debug"])
-async def debug_workload_identity():
-    """Diagnóstico temporal - BORRAR después de resolver"""
-    import subprocess
-    results = {}
-    
-    # 1. ¿Hay credenciales de GCP?
-    try:
-        from google.auth import default
-        credentials, project = default()
-        results["gcp_project"] = project
-        results["credentials_type"] = type(credentials).__name__
-    except Exception as e:
-        results["credentials_error"] = str(e)
-    
-    # 2. ¿Puede alcanzar el metadata server?
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
-            headers={"Metadata-Flavor": "Google"}
-        )
-        resp = urllib.request.urlopen(req, timeout=3)
-        results["service_account_email"] = resp.read().decode()
-    except Exception as e:
-        results["metadata_error"] = str(e)
-    
-    # 3. ¿Puede listar el bucket?
-    try:
-        from google.cloud import storage
-        client = storage.Client()
-        bucket = client.bucket("waste-detection-001-waste-detection-models-dev")
-        blobs = list(client.list_blobs(bucket, prefix="models/", max_results=5))
-        results["bucket_files"] = [b.name for b in blobs]
-    except Exception as e:
-        results["storage_error"] = str(e)
-    
-    return results
-
 
 # ============================================================================
-# Endpoints
+# Endpoints principales
 # ============================================================================
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
-    """
-    Health check del servicio.
-    Verifica el estado del modelo, base de datos y storage.
-    """
+    """Health check del servicio."""
     db_connected = False
     storage_connected = False
     
@@ -376,9 +261,7 @@ async def predict(
 ):
     """
     Realiza inferencia sobre una imagen.
-    
     Acepta formatos: JPEG, PNG, WEBP
-    Retorna las detecciones con clase, confianza y bounding boxes.
     """
     request_id = str(uuid.uuid4())
     start_time = time.time()
@@ -403,7 +286,7 @@ async def predict(
         # Realizar inferencia
         detections = await model_manager.predict(image)
         
-        inference_time = (time.time() - start_time) * 1000  # ms
+        inference_time = (time.time() - start_time) * 1000
         
         # Crear respuesta
         detection_list = [
@@ -445,9 +328,7 @@ async def predict(
 
 @app.get("/models", response_model=List[ModelVersionInfo], tags=["Models"])
 async def list_models():
-    """
-    Lista todas las versiones de modelos disponibles.
-    """
+    """Lista todas las versiones de modelos disponibles."""
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -470,9 +351,7 @@ async def list_models():
 
 @app.post("/models/{version}/activate", tags=["Models"])
 async def activate_model(version: str):
-    """
-    Activa una versión específica del modelo.
-    """
+    """Activa una versión específica del modelo."""
     if not model_manager:
         raise HTTPException(status_code=503, detail="Model manager not available")
     
@@ -487,14 +366,11 @@ async def activate_model(version: str):
 
 @app.post("/training/start", response_model=TrainingResponse, tags=["Training"])
 async def start_training(request: TrainingRequest):
-    """
-    Inicia un job de entrenamiento.
-    
-    Este endpoint dispara un Job de Kubernetes para entrenar el modelo.
-    """
+    """Inicia un job de entrenamiento."""
     job_id = f"training-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     
     try:
+        # TODO
         # Aquí se integraría con la API de Kubernetes para crear el Job
         # Por ahora retornamos un placeholder
         logger.info(f"Entrenamiento solicitado: {job_id}")
@@ -511,9 +387,7 @@ async def start_training(request: TrainingRequest):
 
 @app.get("/metrics", response_model=MetricsResponse, tags=["Monitoring"])
 async def get_metrics():
-    """
-    Retorna métricas del servicio.
-    """
+    """Retorna métricas del servicio."""
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -535,7 +409,7 @@ async def get_metrics():
 
 @app.get("/", tags=["Root"])
 async def root():
-    """Endpoint raíz con información del servicio"""
+    """Endpoint raíz"""
     return {
         "service": "Waste Detection API",
         "version": "1.0.0",
@@ -544,62 +418,9 @@ async def root():
     }
 
 
-@app.get("/training/export", tags=["Training"])
-async def export_training_data(
-    limit: int = Query(1000, description="Número máximo de registros"),
-    min_detections: int = Query(1, description="Mínimo de detecciones por imagen")
-):
-    """
-    Exporta datos de inferencias para reentrenamiento.
-    
-    Retorna las inferencias con sus URLs de imagen y anotaciones,
-    filtradas por número mínimo de detecciones.
-    
-    Los archivos están organizados en GCS:
-    - Imágenes: gs://bucket/inferences/YYYY/MM/DD/{request_id}.jpeg
-    - Anotaciones: gs://bucket/inferences/YYYY/MM/DD/{request_id}.txt
-    
-    El formato de las anotaciones es YOLO:
-    class_id x_center y_center width height (normalizado 0-1)
-    """
-    if not db_manager:
-        raise HTTPException(status_code=503, detail="Database not available")
-    
-    try:
-        # Obtener inferencias con detecciones
-        inferences = await db_manager.get_recent_inferences(limit=limit)
-        
-        # Filtrar por número mínimo de detecciones
-        filtered = [
-            {
-                "request_id": inf.request_id,
-                "timestamp": inf.timestamp.isoformat(),
-                "image_url": inf.image_url,
-                "annotations_url": inf.image_url.replace(".jpeg", ".txt").replace(".jpg", ".txt").replace(".png", ".txt") if inf.image_url else None,
-                "detection_count": inf.detection_count,
-                "detections": inf.detections,
-                "model_version": inf.model_version
-            }
-            for inf in inferences
-            if inf.detection_count >= min_detections and inf.image_url
-        ]
-        
-        return {
-            "total_records": len(filtered),
-            "min_detections_filter": min_detections,
-            "data": filtered
-        }
-        
-    except Exception as e:
-        logger.error(f"Error exportando datos de entrenamiento: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/inferences/{request_id}", tags=["Inference"])
 async def get_inference(request_id: str):
-    """
-    Obtiene los detalles de una inferencia específica por su ID.
-    """
+    """Obtiene los detalles de una inferencia específica."""
     if not db_manager:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -617,7 +438,12 @@ async def get_inference(request_id: str):
             "detection_count": record.detection_count,
             "detections": record.detections,
             "image_url": record.image_url,
-            "annotations_url": record.image_url.replace(".jpeg", ".txt").replace(".jpg", ".txt").replace(".png", ".txt") if record.image_url else None
+            "annotations_url": record.image_url.replace(".jpeg", ".txt").replace(".jpg", ".txt").replace(".png", ".txt") if record.image_url else None,
+            "verification_status": record.verification_status,
+            "verified_detections": record.verified_detections,
+            "verified_by": record.verified_by,
+            "verified_at": record.verified_at.isoformat() if record.verified_at else None,
+            "min_confidence": record.min_confidence,
         }
         
     except HTTPException:
@@ -628,23 +454,285 @@ async def get_inference(request_id: str):
 
 
 # ============================================================================
+# Endpoints de Verificación / Review
+# ============================================================================
+
+@app.get("/review/queue", tags=["Verification"])
+async def get_review_queue(
+    status: Optional[str] = Query(None, description="Filtrar por estado: pending, needs_review, verified, corrected, discarded"),
+    limit: int = Query(20, ge=1, le=100, description="Cantidad de registros"),
+    offset: int = Query(0, ge=0, description="Offset para paginación")
+):
+    """
+    Obtiene la cola de imágenes pendientes de verificación.
+    
+    Prioriza imágenes con needs_review (baja confianza o reportadas),
+    seguidas de pending (sin revisar).
+    """
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        result = await db_manager.get_review_queue(
+            status_filter=status,
+            limit=limit,
+            offset=offset
+        )
+        
+        # Serializar records
+        records_data = []
+        for r in result["records"]:
+            records_data.append({
+                "request_id": r.request_id,
+                "timestamp": r.timestamp.isoformat(),
+                "model_version": r.model_version,
+                "inference_time_ms": r.inference_time_ms,
+                "detection_count": r.detection_count,
+                "detections": r.detections,
+                "image_url": r.image_url,
+                "verification_status": r.verification_status,
+                "verified_detections": r.verified_detections,
+                "verified_by": r.verified_by,
+                "verified_at": r.verified_at.isoformat() if r.verified_at else None,
+                "min_confidence": r.min_confidence,
+            })
+        
+        return {
+            "records": records_data,
+            "status_counts": result["status_counts"],
+            "total_pending": result["total_pending"],
+            "limit": result["limit"],
+            "offset": result["offset"],
+        }
+    except Exception as e:
+        logger.error(f"Error obteniendo cola de revisión: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/review/{request_id}", tags=["Verification"])
+async def update_verification(request_id: str, update: VerificationUpdate):
+    """
+    Actualiza el estado de verificación de una inferencia.
+    
+    Estados posibles:
+    - **verified**: La inferencia del modelo es correcta
+    - **corrected**: Se corrigieron las etiquetas (enviar verified_detections)
+    - **needs_review**: Marcar para revisión posterior
+    - **discarded**: Imagen no útil para entrenamiento
+    """
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        # Validar que si es corrección, tenga detecciones
+        if update.status == VerificationStatus.CORRECTED and not update.verified_detections:
+            raise HTTPException(
+                status_code=400,
+                detail="verified_detections es requerido cuando status='corrected'"
+            )
+        
+        verified_dets = None
+        if update.verified_detections:
+            verified_dets = [d.model_dump() for d in update.verified_detections]
+        
+        record = await db_manager.update_verification(
+            request_id=request_id,
+            status=update.status,
+            verified_detections=verified_dets,
+            verified_by=update.verified_by
+        )
+        
+        if not record:
+            raise HTTPException(status_code=404, detail="Inferencia no encontrada")
+        
+        # Si fue corregida, actualizar anotaciones YOLO en GCS
+        if update.status == VerificationStatus.CORRECTED and verified_dets and storage_manager:
+            try:
+                # Necesitamos el tamaño de imagen para generar anotaciones YOLO
+                # Lo podemos obtener de las detecciones originales o de la imagen
+                if record.image_url:
+                    corrected_detections = [
+                        Detection(**d) for d in verified_dets
+                    ]
+                    # Generar nuevas anotaciones YOLO con las correcciones
+                    # Nota: Necesitamos el tamaño de imagen. Lo guardamos como
+                    # anotaciones con sufijo _verified
+                    yolo_annotations = generate_yolo_annotations_from_dicts(
+                        verified_dets
+                    )
+                    await storage_manager.upload_annotations(
+                        f"{request_id}_verified",
+                        yolo_annotations
+                    )
+            except Exception as e:
+                logger.warning(f"No se pudieron guardar anotaciones corregidas: {e}")
+        
+        return {
+            "status": "success",
+            "request_id": request_id,
+            "verification_status": record.verification_status,
+            "verified_at": record.verified_at.isoformat() if record.verified_at else None,
+        }
+        
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error actualizando verificación {request_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/review/{request_id}/feedback", tags=["Verification"])
+async def submit_user_feedback(request_id: str, feedback: UserFeedback):
+    """
+    Endpoint simplificado para que el usuario dé feedback rápido
+    después de una inferencia: ¿es correcta o no?
+    
+    - Si dice que es correcta → verified
+    - Si dice que NO es correcta → needs_review
+    - Si la confianza mínima < 50% → needs_review sin importar el feedback
+    """
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        record = await db_manager.get_inference(request_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Inferencia no encontrada")
+        
+        # Regla: si la confianza mínima es < 50%, siempre needs_review
+        confidence_threshold = settings.confidence_threshold
+        force_review = (
+            record.min_confidence is not None 
+            and record.min_confidence < confidence_threshold
+        )
+        
+        if force_review:
+            new_status = VerificationStatus.NEEDS_REVIEW
+        elif feedback.is_correct:
+            new_status = VerificationStatus.VERIFIED
+        else:
+            new_status = VerificationStatus.NEEDS_REVIEW
+        
+        updated = await db_manager.update_verification(
+            request_id=request_id,
+            status=new_status,
+            verified_by=feedback.user_id
+        )
+        
+        return {
+            "status": "success",
+            "request_id": request_id,
+            "verification_status": new_status,
+            "forced_review": force_review,
+            "message": (
+                "Marcada para revisión manual (confianza baja)" 
+                if force_review 
+                else ("Verificada como correcta" if feedback.is_correct else "Marcada para revisión")
+            )
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error procesando feedback {request_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/review/stats", tags=["Verification"])
+async def get_verification_stats():
+    """Obtiene estadísticas del proceso de verificación."""
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        return await db_manager.get_verification_stats()
+    except Exception as e:
+        logger.error(f"Error obteniendo stats de verificación: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/review/classes", tags=["Verification"])
+async def get_available_classes():
+    """Retorna las clases disponibles para re-etiquetar."""
+    return {
+        "classes": [
+            {"id": k, "name": v} for k, v in WASTE_CLASSES.items()
+        ]
+    }
+
+
+@app.get("/training/export", tags=["Training"])
+async def export_training_data(
+    limit: int = Query(1000, description="Número máximo de registros"),
+    min_detections: int = Query(1, description="Mínimo de detecciones por imagen"),
+    only_verified: bool = Query(False, description="Solo exportar datos verificados/corregidos")
+):
+    """
+    Exporta datos de inferencias para reentrenamiento.
+    
+    Si only_verified=True, exporta solo datos que pasaron por verificación humana,
+    usando las detecciones corregidas cuando estén disponibles.
+    """
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        if only_verified:
+            inferences = await db_manager.get_verified_training_data(limit=limit)
+        else:
+            inferences = await db_manager.get_recent_inferences(limit=limit)
+        
+        filtered = []
+        for inf in inferences:
+            if inf.detection_count < min_detections or not inf.image_url:
+                continue
+            
+            # Si fue corregida, usar las detecciones verificadas
+            effective_detections = inf.detections
+            annotations_suffix = ""
+            if inf.verification_status == VerificationStatus.CORRECTED and inf.verified_detections:
+                effective_detections = inf.verified_detections
+                annotations_suffix = "_verified"
+            
+            filtered.append({
+                "request_id": inf.request_id,
+                "timestamp": inf.timestamp.isoformat(),
+                "image_url": inf.image_url,
+                "annotations_url": (
+                    inf.image_url
+                    .replace(".jpeg", f"{annotations_suffix}.txt")
+                    .replace(".jpg", f"{annotations_suffix}.txt")
+                    .replace(".png", f"{annotations_suffix}.txt")
+                    if inf.image_url else None
+                ),
+                "detection_count": len(effective_detections),
+                "detections": effective_detections,
+                "model_version": inf.model_version,
+                "verification_status": inf.verification_status,
+            })
+        
+        return {
+            "total_records": len(filtered),
+            "min_detections_filter": min_detections,
+            "only_verified": only_verified,
+            "data": filtered
+        }
+        
+    except Exception as e:
+        logger.error(f"Error exportando datos de entrenamiento: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
 # Funciones auxiliares
 # ============================================================================
 
 def generate_yolo_annotations(detections: List[Detection], img_width: int, img_height: int) -> str:
     """
     Convierte detecciones al formato de anotación YOLO.
-    
-    Formato YOLO: class_id x_center y_center width height
-    (todos los valores normalizados entre 0 y 1)
-    
-    Args:
-        detections: Lista de detecciones
-        img_width: Ancho de la imagen
-        img_height: Alto de la imagen
-        
-    Returns:
-        String con las anotaciones en formato YOLO (una línea por detección)
+    Formato: class_id x_center y_center width height (normalizado 0-1)
     """
     lines = []
     
@@ -666,6 +754,27 @@ def generate_yolo_annotations(detections: List[Detection], img_width: int, img_h
         
         # Formato: class_id x_center y_center width height
         line = f"{det.class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+        lines.append(line)
+    
+    return "\n".join(lines)
+
+
+def generate_yolo_annotations_from_dicts(detections: List[Dict]) -> str:
+    """
+    Genera anotaciones YOLO desde diccionarios de detecciones.
+    Nota: Las bbox se guardan tal cual si no tenemos tamaño de imagen.
+    En ese caso se asume que ya están en coordenadas absolutas y se 
+    guardan como referencia para post-procesamiento.
+    """
+    lines = []
+    for det in detections:
+        class_id = det.get("class_id", 0)
+        bbox = det.get("bbox", [0, 0, 0, 0])
+        x1, y1, x2, y2 = bbox
+        
+        # Guardar en formato YOLO relativo (estimación)
+        # El post-procesamiento real debería usar el tamaño de imagen
+        line = f"{class_id} {x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f}"
         lines.append(line)
     
     return "\n".join(lines)
@@ -693,8 +802,8 @@ async def save_inference_record(
             if response.detections:
                 yolo_annotations = generate_yolo_annotations(
                     response.detections,
-                    response.image_size[0],  # width
-                    response.image_size[1]   # height
+                    response.image_size[0],
+                    response.image_size[1]
                 )
                 annotations_url = await storage_manager.upload_annotations(
                     request_id,
@@ -702,7 +811,17 @@ async def save_inference_record(
                 )
                 logger.info(f"Anotaciones guardadas: {annotations_url}")
         
-        # Guardar registro en BD
+        # Calcular confianza mínima de las detecciones
+        min_confidence = None
+        if response.detections:
+            min_confidence = min(d.confidence for d in response.detections)
+        
+        # Determinar estado inicial de verificación
+        # Si la confianza mínima < umbral → needs_review automáticamente
+        initial_status = VerificationStatus.PENDING
+        if min_confidence is not None and min_confidence < settings.confidence_threshold:
+            initial_status = VerificationStatus.NEEDS_REVIEW
+        
         if db_manager:
             record = InferenceRecord(
                 request_id=request_id,
@@ -711,11 +830,15 @@ async def save_inference_record(
                 inference_time_ms=response.inference_time_ms,
                 detection_count=response.detection_count,
                 detections=[d.model_dump() for d in response.detections],
-                image_url=image_url
+                image_url=image_url,
+                verification_status=initial_status,
+                min_confidence=min_confidence
             )
             await db_manager.save_inference(record)
-            logger.info(f"Registro guardado en BD: {request_id}")
-            
+            logger.info(
+                f"Registro guardado: {request_id} "
+                f"(status={initial_status}, min_conf={min_confidence})"
+            )
             
     except Exception as e:
         logger.error(f"Error guardando registro {request_id}: {e}")
