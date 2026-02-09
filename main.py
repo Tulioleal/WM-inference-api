@@ -10,7 +10,7 @@ import time
 import uuid
 import logging
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
 
 import uvicorn
