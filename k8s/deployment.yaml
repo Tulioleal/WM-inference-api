@@ -51,7 +51,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: inference-api
-          image: us-central1-docker.pkg.dev/waste-detection-001/waste-detection-dev/inference-api:latest
+          image: us-central1-docker.pkg.dev/waste-detection-001/waste-detection-prod/inference-api:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
