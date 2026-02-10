@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import numpy as np
 from PIL import Image
@@ -452,6 +452,30 @@ async def get_inference(request_id: str):
         logger.error(f"Error obteniendo inferencia {request_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/images/{request_id}", tags=["Images"])
+async def get_image(request_id: str):
+    """Sirve la imagen de una inferencia desde GCS."""
+    if not db_manager or not storage_manager:
+        raise HTTPException(status_code=503, detail="Service not available")
+    
+    record = await db_manager.get_inference(request_id)
+    if not record or not record.image_url:
+        raise HTTPException(status_code=404, detail="Image not found")
+    
+    try:
+        image_bytes = await storage_manager.download_image(record.image_url)
+        
+        # Detectar content type por extensión
+        content_type = "image/jpeg"
+        if record.image_url.endswith(".png"):
+            content_type = "image/png"
+        elif record.image_url.endswith(".webp"):
+            content_type = "image/webp"
+        
+        return Response(content=image_bytes, media_type=content_type)
+    except Exception as e:
+        logger.error(f"Error sirviendo imagen {request_id}: {e}")
+        raise HTTPException(status_code=500, detail="Error retrieving image")
 
 # ============================================================================
 # Endpoints de Verificación / Review
