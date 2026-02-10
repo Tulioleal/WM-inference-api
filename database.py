@@ -252,20 +252,7 @@ class DatabaseManager:
             """, request_id)
             
             if row:
-                return InferenceRecord(
-                    request_id=row['request_id'],
-                    timestamp=row['timestamp'],
-                    model_version=row['model_version'],
-                    inference_time_ms=row['inference_time_ms'],
-                    detection_count=row['detection_count'],
-                    detections=row['detections'] or [],
-                    image_url=row['image_url'],
-                    verification_status=row['verification_status'] or VerificationStatus.PENDING,
-                    verified_detections=row['verified_detections'],
-                    verified_by=row['verified_by'],
-                    verified_at=row['verified_at'],
-                    min_confidence=row['min_confidence']
-                )
+                return self._row_to_inference(row)
             return None
     
     async def get_inference_stats(self) -> Dict[str, Any]:
@@ -696,10 +683,10 @@ class DatabaseManager:
             model_version=row['model_version'],
             inference_time_ms=row['inference_time_ms'],
             detection_count=row['detection_count'],
-            detections=row['detections'] or [],
+            detections=json.loads(row['detections']) if isinstance(row['detections'], str) else (row['detections'] or []),
             image_url=row['image_url'],
             verification_status=row.get('verification_status', VerificationStatus.PENDING) or VerificationStatus.PENDING,
-            verified_detections=row.get('verified_detections'),
+            verified_detections=json.loads(row['verified_detections']) if isinstance(row.get('verified_detections'), str) else row.get('verified_detections'),
             verified_by=row.get('verified_by'),
             verified_at=row.get('verified_at'),
             min_confidence=row.get('min_confidence')
