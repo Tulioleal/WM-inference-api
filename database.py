@@ -234,7 +234,7 @@ class DatabaseManager:
                 record.model_version,
                 record.inference_time_ms,
                 record.detection_count,
-                record.detections,  # asyncpg maneja JSON automáticamente
+                json.dumps(record.detections),  # asyncpg maneja JSON automáticamente
                 record.image_url,
                 record.verification_status,
                 record.min_confidence
