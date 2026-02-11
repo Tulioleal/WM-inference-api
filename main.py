@@ -363,28 +363,6 @@ async def activate_model(version: str):
         logger.error(f"Error activando modelo {version}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.post("/training/start", response_model=TrainingResponse, tags=["Training"])
-async def start_training(request: TrainingRequest):
-    """Inicia un job de entrenamiento."""
-    job_id = f"training-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
-    
-    try:
-        # TODO
-        # Aquí se integraría con la API de Kubernetes para crear el Job
-        # Por ahora retornamos un placeholder
-        logger.info(f"Entrenamiento solicitado: {job_id}")
-        
-        return TrainingResponse(
-            job_id=job_id,
-            status="queued",
-            message=f"Entrenamiento iniciado con {request.epochs} epochs"
-        )
-    except Exception as e:
-        logger.error(f"Error iniciando entrenamiento: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @app.get("/metrics", response_model=MetricsResponse, tags=["Monitoring"])
 async def get_metrics():
     """Retorna métricas del servicio."""
@@ -686,7 +664,6 @@ async def get_available_classes():
         ]
     }
 
-
 @app.get("/training/export", tags=["Training"])
 async def export_training_data(
     limit: int = Query(1000, description="Número máximo de registros"),
@@ -748,6 +725,80 @@ async def export_training_data(
         logger.error(f"Error exportando datos de entrenamiento: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/training/export-to-gcs", tags=["Training"])
+async def export_verified_to_gcs(
+    min_detections: int = Query(1, description="Mínimo de detecciones por imagen"),
+):
+    """
+    Exporta los request_ids de inferencias verificadas/corregidas a un JSON en GCS.
+    Este archivo es leído por el training job en Vast.ai para saber qué imágenes descargar.
+    
+    Genera: gs://{images_bucket}/training_exports/verified_requests.json
+    """
+    if not db_manager:
+        raise HTTPException(status_code=503, detail="Database not available")
+    if not storage_manager:
+        raise HTTPException(status_code=503, detail="Storage not available")
+    
+    try:
+        import json
+        from google.cloud import storage as gcs_storage
+        
+        # Obtener inferencias verificadas
+        inferences = await db_manager.get_verified_training_data(limit=10000)
+        
+        # Filtrar
+        export_data = []
+        for inf in inferences:
+            if inf.detection_count < min_detections or not inf.image_url:
+                continue
+            
+            # Si fue corregida, usar detecciones verificadas
+            effective_detections = inf.detections
+            if inf.verification_status == VerificationStatus.CORRECTED and inf.verified_detections:
+                effective_detections = inf.verified_detections
+            
+            export_data.append({
+                "request_id": inf.request_id,
+                "timestamp": inf.timestamp.isoformat(),
+                "image_url": inf.image_url,
+                "verification_status": inf.verification_status,
+                "detection_count": len(effective_detections),
+            })
+        
+        if not export_data:
+            return {
+                "status": "empty",
+                "message": "No hay inferencias verificadas para exportar",
+                "total_records": 0
+            }
+        
+        # Subir a GCS
+        export_json = json.dumps({
+            "exported_at": datetime.utcnow().isoformat(),
+            "total_records": len(export_data),
+            "min_detections_filter": min_detections,
+            "request_ids": [d["request_id"] for d in export_data],
+            "data": export_data
+        }, indent=2)
+        
+        bucket = storage_manager.storage_client.bucket(storage_manager.images_bucket)
+        blob = bucket.blob("training_exports/verified_requests.json")
+        blob.upload_from_string(export_json, content_type="application/json")
+        
+        gcs_path = f"gs://{storage_manager.images_bucket}/training_exports/verified_requests.json"
+        logger.info(f"Exportados {len(export_data)} registros a {gcs_path}")
+        
+        return {
+            "status": "success",
+            "total_records": len(export_data),
+            "gcs_path": gcs_path,
+            "message": f"Exportados {len(export_data)} registros verificados a GCS"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error exportando a GCS: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
 # Funciones auxiliares
