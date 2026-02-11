@@ -782,11 +782,12 @@ async def export_verified_to_gcs(
             "data": export_data
         }, indent=2)
         
-        bucket = storage_manager.storage_client.bucket(storage_manager.images_bucket)
+        bucket = storage_manager.images_bucket
         blob = bucket.blob("training_exports/verified_requests.json")
         blob.upload_from_string(export_json, content_type="application/json")
         
-        gcs_path = f"gs://{storage_manager.images_bucket}/training_exports/verified_requests.json"
+        gcs_path = f"gs://{storage_manager.images_bucket_name}/training_exports/verified_requests.json"
+
         logger.info(f"Exportados {len(export_data)} registros a {gcs_path}")
         
         return {
