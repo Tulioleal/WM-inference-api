@@ -242,12 +242,23 @@ async def health_check():
             storage_connected = await storage_manager.health_check()
     except Exception:
         pass
+
+    if storage_manager:
+        try:
+            bucket = storage_manager.models_bucket
+            blob = bucket.blob("models/latest/metadata.json")
+            if blob.exists():
+                import json
+                meta = json.loads(blob.download_as_string())
+                real_version = f"latest ({meta.get('version', '?')})"
+        except:
+            pass
     
     return HealthResponse(
         status="healthy" if model_manager and model_manager.model else "degraded",
         timestamp=datetime.utcnow().isoformat(),
         model_loaded=model_manager is not None and model_manager.model is not None,
-        model_version=model_manager.current_version if model_manager else "unknown",
+        model_version=real_version,
         database_connected=db_connected,
         storage_connected=storage_connected
     )
