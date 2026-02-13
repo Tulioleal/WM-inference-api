@@ -31,7 +31,6 @@ class Settings(BaseSettings):
     # Google Cloud Storage
     gcs_models_bucket: str
     gcs_images_bucket: str
-    gcs_datasets_bucket: Optional[str]
     
     # Modelo
     model_version: str = "latest"
